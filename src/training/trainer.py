@@ -5,6 +5,11 @@ Trainer Module for Hybrid Emotion Classification
 학습, 검증, 평가 로직을 담당합니다.
 
 ⚠️ CUDA 필수: 이 모듈은 CUDA가 있을 때만 최적 성능을 발휘합니다.
+
+개선 사항 (v2):
+    - Label Smoothing 지원
+    - Warmup Scheduler 지원
+    - Cosine Annealing with Warm Restarts
 """
 
 # pyright: reportAttributeAccessIssue=false
@@ -210,6 +215,10 @@ class Trainer:
         live_plot: bool = False,
         plot_update_interval: int = 1,
         plot_save_dir: Optional[Path] = None,
+        # v2 추가: Label Smoothing 및 Warmup
+        label_smoothing: float = 0.0,
+        warmup_epochs: int = 0,
+        scheduler_type: str = "cosine",  # "cosine", "cosine_warmup", "step", "plateau"
     ):
         """
         Args:
@@ -235,6 +244,9 @@ class Trainer:
             live_plot: 실시간 플롯 사용 여부
             plot_update_interval: 플롯 업데이트 간격 (에폭 단위)
             plot_save_dir: 플롯 저장 디렉토리
+            label_smoothing: Label Smoothing 값 (0.0 ~ 0.2 권장)
+            warmup_epochs: Warmup 에폭 수
+            scheduler_type: 스케줄러 타입 ("cosine", "cosine_warmup", "step", "plateau")
         """
         self.model = model
         self.train_loader = train_loader
@@ -267,20 +279,59 @@ class Trainer:
 
         # 스케줄러
         self.scheduler: Optional[LRScheduler]
+        self.warmup_epochs = warmup_epochs
+        self.warmup_scheduler: Optional[LRScheduler] = None
+
         if scheduler is None:
-            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer,
-                T_max=num_epochs,
-                eta_min=learning_rate * 0.01,
-            )
+            if scheduler_type == "cosine_warmup" or warmup_epochs > 0:
+                # Cosine Annealing with Warm Restarts
+                main_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                    self.optimizer,
+                    T_0=max(10, (num_epochs - warmup_epochs) // 3),
+                    T_mult=2,
+                    eta_min=learning_rate * 0.001,
+                )
+                if warmup_epochs > 0:
+                    # Linear warmup scheduler
+                    self.warmup_scheduler = optim.lr_scheduler.LinearLR(
+                        self.optimizer,
+                        start_factor=0.1,
+                        end_factor=1.0,
+                        total_iters=warmup_epochs,
+                    )
+                self.scheduler = main_scheduler
+            elif scheduler_type == "plateau":
+                self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                    self.optimizer,
+                    mode="max",
+                    factor=0.5,
+                    patience=3,
+                    verbose=True,
+                )
+            elif scheduler_type == "step":
+                self.scheduler = optim.lr_scheduler.StepLR(
+                    self.optimizer,
+                    step_size=10,
+                    gamma=0.1,
+                )
+            else:  # cosine (기본값)
+                self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                    self.optimizer,
+                    T_max=num_epochs,
+                    eta_min=learning_rate * 0.01,
+                )
         else:
             self.scheduler = scheduler
 
-        # 손실 함수
+        # 손실 함수 (Label Smoothing 지원)
+        self.label_smoothing = label_smoothing
         if criterion is None:
             if class_weights is not None:
                 class_weights = class_weights.to(self.device)
-            self.criterion = nn.CrossEntropyLoss(weight=class_weights)
+            self.criterion = nn.CrossEntropyLoss(
+                weight=class_weights,
+                label_smoothing=label_smoothing,
+            )
         else:
             self.criterion = criterion
 
@@ -333,12 +384,15 @@ class Trainer:
         if self.live_plot:
             self._setup_live_plotter()
 
-        print("\nTrainer 초기화 완료:")
+        print("\nTrainer 초기화 완료 (v2):")
         print(f"  - 디바이스: {self.device}")
         print_cuda_info()
         print(f"  - 에폭 수: {num_epochs}")
         print(f"  - 학습률: {learning_rate}")
         print(f"  - AMP (Mixed Precision): {self.use_amp}")
+        print(f"  - Label Smoothing: {label_smoothing}")
+        print(f"  - Warmup 에폭: {warmup_epochs}")
+        print(f"  - 스케줄러: {scheduler_type}")
         print(f"  - 학습 배치 수: {len(train_loader)}")
         print(f"  - 검증 배치 수: {len(val_loader)}")
         print(f"  - 실시간 Plotting: {'✓' if self.live_plot else '✗'}")
@@ -524,9 +578,16 @@ class Trainer:
                 # 검증
                 val_metrics = self.validate()
 
-                # 스케줄러 업데이트
-                if self.scheduler is not None:
-                    self.scheduler.step()
+                # 스케줄러 업데이트 (Warmup 지원)
+                if epoch < self.warmup_epochs and self.warmup_scheduler is not None:
+                    # Warmup 단계
+                    self.warmup_scheduler.step()
+                elif self.scheduler is not None:
+                    # 메인 스케줄러
+                    if isinstance(self.scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+                        self.scheduler.step(val_metrics["accuracy"])
+                    else:
+                        self.scheduler.step()
 
                 # 현재 학습률
                 current_lr = self.optimizer.param_groups[0]["lr"]

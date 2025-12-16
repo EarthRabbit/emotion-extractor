@@ -1,11 +1,19 @@
 """
-Hybrid Emotion Classification Pipeline
+Hybrid Emotion Classification Pipeline (v2)
 하이브리드 감정 분류 파이프라인
 
 CNN + 사전 추출된 FaceNet 특징을 결합하여 감정을 분류합니다.
 
+개선 사항 (v2):
+    - 더 깊은 FaceNet Projector (4 블록)
+    - Bilinear/Attention Fusion 지원
+    - Label Smoothing 지원
+    - Warmup Scheduler 지원
+    - 다양한 프리셋 설정 지원
+
 사용법:
     python pipeline.py --mode train
+    python pipeline.py --mode train --preset improved_v2
     python pipeline.py --mode train --live-plot
     python pipeline.py --mode eval --checkpoint checkpoints/best_model.pth
     python pipeline.py --mode predict --image path/to/image.jpg
@@ -27,8 +35,10 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from config import (  # noqa: E402
     Config,
     get_class_name,
+    get_config_by_name,
     get_default_config,
     get_light_config,
+    list_presets,
 )
 from data.dataset import create_dataloaders, get_transforms  # noqa: E402
 from models.hybrid_model import HybridEmotionModel, HybridEmotionModelLite  # noqa: E402
@@ -61,7 +71,11 @@ def print_banner():
 
 def setup_config(args) -> Config:
     """설정 초기화"""
-    if args.light:
+    # 프리셋 선택
+    if hasattr(args, "preset") and args.preset:
+        config = get_config_by_name(args.preset)
+        print(f"[설정] 프리셋 '{args.preset}' 로드됨")
+    elif args.light:
         config = get_light_config()
     else:
         config = get_default_config()
@@ -87,6 +101,14 @@ def setup_config(args) -> Config:
     if args.fusion:
         config.model.fusion.fusion_type = args.fusion
 
+    # v2 추가: Label Smoothing
+    if hasattr(args, "label_smoothing") and args.label_smoothing is not None:
+        config.training.label_smoothing = args.label_smoothing
+
+    # v2 추가: FaceNet 블록 수
+    if hasattr(args, "facenet_blocks") and args.facenet_blocks:
+        config.model.facenet.num_blocks = args.facenet_blocks
+
     # FaceNet 벡터 경로
     if args.facenet_vectors:
         config.model.facenet.vectors_path = Path(args.facenet_vectors)
@@ -109,7 +131,7 @@ def setup_config(args) -> Config:
 
 
 def create_model(config: Config) -> torch.nn.Module:
-    """모델 생성"""
+    """모델 생성 (v2 개선 옵션 지원)"""
     use_facenet = config.model.use_facenet_branch and config.model.facenet.enabled
     use_cnn = config.model.use_cnn_branch
 
@@ -120,6 +142,7 @@ def create_model(config: Config) -> torch.nn.Module:
             use_facenet_branch=True,
             facenet_input_dim=config.model.facenet.input_dim,
             facenet_feature_dim=config.model.facenet.feature_dim,
+            facenet_num_blocks=config.model.facenet.num_blocks,  # v2: 블록 수
             # CNN 설정
             use_cnn_branch=True,
             cnn_backbone=config.model.cnn.backbone,
@@ -131,10 +154,12 @@ def create_model(config: Config) -> torch.nn.Module:
             fusion_type=config.model.fusion.fusion_type,
             fusion_output_dim=config.model.fusion.output_dim,
             attention_heads=config.model.fusion.attention_heads,
+            use_se=config.model.fusion.use_se,  # v2: SE 블록
             # Classification 설정
             num_classes=config.data.num_classes,
-            classifier_hidden_dims=config.model.classifier_hidden_dims,
-            dropout=config.model.classifier_dropout,
+            classifier_hidden_dims=config.model.classifier.hidden_dims,
+            dropout=config.model.classifier.dropout,
+            use_classifier_residual=config.model.classifier.use_residual,  # v2: Residual
             device=config.device,
         )
     elif use_facenet:
@@ -143,20 +168,21 @@ def create_model(config: Config) -> torch.nn.Module:
             use_facenet_branch=True,
             facenet_input_dim=config.model.facenet.input_dim,
             facenet_feature_dim=config.model.facenet.feature_dim,
+            facenet_num_blocks=config.model.facenet.num_blocks,  # v2: 블록 수
             use_cnn_branch=False,
             num_classes=config.data.num_classes,
-            classifier_hidden_dims=config.model.classifier_hidden_dims,
-            dropout=config.model.classifier_dropout,
+            classifier_hidden_dims=config.model.classifier.hidden_dims,
+            dropout=config.model.classifier.dropout,
+            use_classifier_residual=config.model.classifier.use_residual,  # v2: Residual
             device=config.device,
         )
     elif use_cnn:
         # CNN만 사용 (Lite 모델)
         model = HybridEmotionModelLite(
-            backbone=config.model.cnn.backbone,
-            feature_dim=config.model.cnn.feature_dim,
+            input_dim=config.model.cnn.feature_dim,
+            hidden_dims=config.model.classifier.hidden_dims,
             num_classes=config.data.num_classes,
-            pretrained=config.model.cnn.pretrained,
-            dropout=config.model.classifier_dropout,
+            dropout=config.model.classifier.dropout,
         )
     else:
         raise ValueError("최소 하나의 브랜치 (FaceNet 또는 CNN)가 필요합니다.")
@@ -187,8 +213,13 @@ def train_pipeline(config: Config, args):
     print(f"  - 에폭 수: {config.training.num_epochs}")
     print(f"  - 학습률: {config.training.learning_rate}")
     print(f"  - FaceNet 사용: {config.model.use_facenet_branch}")
+    if config.model.use_facenet_branch:
+        print(f"  - FaceNet 블록 수: {config.model.facenet.num_blocks}")
     print(f"  - CNN 백본: {config.model.cnn.backbone}")
     print(f"  - Fusion: {config.model.fusion.fusion_type}")
+    print(f"  - Fusion SE: {config.model.fusion.use_se}")
+    print(f"  - Label Smoothing: {config.training.label_smoothing}")
+    print(f"  - Warmup 에폭: {config.training.warmup_epochs}")
     print(f"  - Num Workers: {config.training.num_workers}")
     print(f"  - AMP (Mixed Precision): {config.training.use_amp}")
     print(f"  - 실시간 Plotting: {args.live_plot}")
@@ -232,7 +263,7 @@ def train_pipeline(config: Config, args):
     # 플롯 저장 디렉토리
     plot_save_dir = config.training.checkpoint_dir / config.experiment_name / "plots"
 
-    # Trainer 생성
+    # Trainer 생성 (v2 옵션 추가)
     print("\n[3/4] Trainer 초기화 중...")
     trainer = Trainer(
         model=model,
@@ -255,6 +286,10 @@ def train_pipeline(config: Config, args):
         live_plot=args.live_plot,
         plot_update_interval=1,
         plot_save_dir=plot_save_dir,
+        # v2 추가 옵션
+        label_smoothing=config.training.label_smoothing,
+        warmup_epochs=config.training.warmup_epochs,
+        scheduler_type=config.training.scheduler,
     )
 
     # 학습
@@ -679,6 +714,12 @@ def main():
     )
 
     # 선택 인자
+    parser.add_argument(
+        "--preset",
+        type=str,
+        choices=list(list_presets().keys()),
+        help="설정 프리셋 선택 (예: improved_v2, max_performance)",
+    )
     parser.add_argument("--light", action="store_true", help="경량 설정 사용")
     parser.add_argument("--name", type=str, help="실험 이름")
     parser.add_argument("--batch-size", type=int, help="배치 크기")
@@ -688,13 +729,28 @@ def main():
         "--backbone", type=str, help="CNN 백본 (resnet18, resnet34, ...)"
     )
     parser.add_argument(
-        "--fusion", type=str, choices=["concat", "attention", "weighted_sum", "gated"]
+        "--fusion",
+        type=str,
+        choices=["concat", "attention", "weighted_sum", "gated", "bilinear"],
+        help="특징 융합 방식",
     )
     parser.add_argument(
         "--no-facenet", action="store_true", help="FaceNet 브랜치 비활성화"
     )
     parser.add_argument("--no-cnn", action="store_true", help="CNN 브랜치 비활성화")
     parser.add_argument("--facenet-vectors", type=str, help="FaceNet 벡터 파일 경로")
+
+    # v2 추가 옵션
+    parser.add_argument(
+        "--label-smoothing",
+        type=float,
+        help="Label Smoothing 값 (0.0 ~ 0.2 권장)",
+    )
+    parser.add_argument(
+        "--facenet-blocks",
+        type=int,
+        help="FaceNet Projector 블록 수 (기본값: 4)",
+    )
     parser.add_argument("--checkpoint", type=str, help="체크포인트 파일 경로")
     parser.add_argument("--image", type=str, help="예측할 이미지 경로")
 
@@ -709,8 +765,24 @@ def main():
         action="store_true",
         help="학습/평가 후 분석 리포트 생성",
     )
+    parser.add_argument(
+        "--list-presets",
+        action="store_true",
+        help="사용 가능한 프리셋 목록 출력",
+    )
 
     args = parser.parse_args()
+
+    # 프리셋 목록 출력
+    if hasattr(args, "list_presets") and args.list_presets:
+        print_banner()
+        print("\n[사용 가능한 프리셋]")
+        print("-" * 50)
+        for name, desc in list_presets().items():
+            print(f"  {name:20s} : {desc}")
+        print("-" * 50)
+        print("\n사용 예시: python pipeline.py --mode train --preset improved_v2")
+        return
 
     # CUDA 정보 확인 모드
     if args.mode == "check-cuda":

@@ -8,6 +8,12 @@ CNN 기반 이미지 특징 + 사전 추출된 FaceNet 특징을 결합하여
 사용법:
     1. extract_facenet_vectors.py로 FaceNet 벡터 사전 추출
     2. 학습 시 사전 추출된 벡터와 이미지를 함께 사용
+
+개선 사항 (v2):
+    - Bilinear Fusion 추가
+    - Multi-Head Cross Attention 강화
+    - Squeeze-and-Excitation 기반 채널 가중치
+    - 더 깊은 Classification Head
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -20,15 +26,53 @@ from .cnn_branch import CNNFeatureExtractor, CNNFeatureExtractorMultiScale
 from .facenet_feature import FaceNetFeatureProjector
 
 
+class SqueezeExcitation(nn.Module):
+    """
+    Squeeze-and-Excitation 블록
+
+    채널별 중요도를 학습하여 가중치를 적용합니다.
+    """
+
+    def __init__(self, dim: int, reduction: int = 4):
+        """
+        Args:
+            dim: 입력 차원
+            reduction: 축소 비율
+        """
+        super().__init__()
+
+        self.squeeze = nn.AdaptiveAvgPool1d(1)
+        self.excitation = nn.Sequential(
+            nn.Linear(dim, dim // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(dim // reduction, dim),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: 입력 텐서 [B, dim]
+
+        Returns:
+            가중치가 적용된 텐서 [B, dim]
+        """
+        # [B, dim] -> [B, dim, 1] for pooling
+        b, d = x.shape
+        scale = self.excitation(x)  # [B, dim]
+        return x * scale
+
+
 class FeatureFusion(nn.Module):
     """
-    특징 융합 모듈
+    특징 융합 모듈 (개선된 버전)
 
     다양한 융합 방식을 지원합니다:
     - concat: 단순 연결
-    - attention: 크로스 어텐션
+    - attention: 크로스 어텐션 (개선됨)
     - weighted_sum: 가중 합
     - gated: 게이트 메커니즘
+    - bilinear: Bilinear Fusion (새로 추가)
     """
 
     def __init__(
@@ -39,65 +83,154 @@ class FeatureFusion(nn.Module):
         fusion_type: str = "concat",
         attention_heads: int = 4,
         dropout: float = 0.1,
+        use_se: bool = True,
     ):
         """
         Args:
             facenet_dim: FaceNet 특징 차원
             cnn_dim: CNN 특징 차원
             output_dim: 출력 차원
-            fusion_type: 융합 방식 ("concat", "attention", "weighted_sum", "gated")
+            fusion_type: 융합 방식 ("concat", "attention", "weighted_sum", "gated", "bilinear")
             attention_heads: 어텐션 헤드 수 (attention 방식일 때)
             dropout: 드롭아웃 비율
+            use_se: Squeeze-and-Excitation 사용 여부
         """
         super().__init__()
 
         self.fusion_type = fusion_type
         self.output_dim = output_dim
+        self.use_se = use_se
 
         if fusion_type == "concat":
-            # 단순 연결 후 프로젝션
+            # 단순 연결 후 프로젝션 (개선: 3-layer로 확장)
             self.projection = nn.Sequential(
                 nn.Linear(facenet_dim + cnn_dim, output_dim * 2),
                 nn.LayerNorm(output_dim * 2),
-                nn.ReLU(inplace=True),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(output_dim * 2, output_dim * 2),
+                nn.LayerNorm(output_dim * 2),
+                nn.GELU(),
                 nn.Dropout(dropout),
                 nn.Linear(output_dim * 2, output_dim),
+                nn.LayerNorm(output_dim),
             )
 
+            if use_se:
+                self.se = SqueezeExcitation(output_dim)
+
         elif fusion_type == "attention":
-            # 크로스 어텐션
-            self.facenet_proj = nn.Linear(facenet_dim, output_dim)
-            self.cnn_proj = nn.Linear(cnn_dim, output_dim)
-            self.attention = nn.MultiheadAttention(
+            # 개선된 크로스 어텐션
+            self.facenet_proj = nn.Sequential(
+                nn.Linear(facenet_dim, output_dim),
+                nn.LayerNorm(output_dim),
+            )
+            self.cnn_proj = nn.Sequential(
+                nn.Linear(cnn_dim, output_dim),
+                nn.LayerNorm(output_dim),
+            )
+
+            # Multi-head Cross Attention
+            self.cross_attention = nn.MultiheadAttention(
                 embed_dim=output_dim,
                 num_heads=attention_heads,
                 dropout=dropout,
                 batch_first=True,
             )
-            self.norm = nn.LayerNorm(output_dim)
+
+            # Self Attention (추가)
+            self.self_attention = nn.MultiheadAttention(
+                embed_dim=output_dim,
+                num_heads=attention_heads,
+                dropout=dropout,
+                batch_first=True,
+            )
+
+            self.norm1 = nn.LayerNorm(output_dim)
+            self.norm2 = nn.LayerNorm(output_dim)
+            self.norm3 = nn.LayerNorm(output_dim)
+
+            # FFN (개선: 더 깊게)
             self.ffn = nn.Sequential(
-                nn.Linear(output_dim, output_dim * 2),
-                nn.ReLU(inplace=True),
+                nn.Linear(output_dim, output_dim * 4),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(output_dim * 4, output_dim * 2),
+                nn.GELU(),
                 nn.Dropout(dropout),
                 nn.Linear(output_dim * 2, output_dim),
             )
 
+            if use_se:
+                self.se = SqueezeExcitation(output_dim)
+
         elif fusion_type == "weighted_sum":
             # 학습 가능한 가중치로 합
-            self.facenet_proj = nn.Linear(facenet_dim, output_dim)
-            self.cnn_proj = nn.Linear(cnn_dim, output_dim)
+            self.facenet_proj = nn.Sequential(
+                nn.Linear(facenet_dim, output_dim),
+                nn.LayerNorm(output_dim),
+            )
+            self.cnn_proj = nn.Sequential(
+                nn.Linear(cnn_dim, output_dim),
+                nn.LayerNorm(output_dim),
+            )
             self.weights = nn.Parameter(torch.ones(2) / 2)
             self.norm = nn.LayerNorm(output_dim)
 
+            if use_se:
+                self.se = SqueezeExcitation(output_dim)
+
         elif fusion_type == "gated":
-            # 게이트 메커니즘
-            self.facenet_proj = nn.Linear(facenet_dim, output_dim)
-            self.cnn_proj = nn.Linear(cnn_dim, output_dim)
+            # 게이트 메커니즘 (개선)
+            self.facenet_proj = nn.Sequential(
+                nn.Linear(facenet_dim, output_dim),
+                nn.LayerNorm(output_dim),
+            )
+            self.cnn_proj = nn.Sequential(
+                nn.Linear(cnn_dim, output_dim),
+                nn.LayerNorm(output_dim),
+            )
+
+            # 개선된 게이트 네트워크
             self.gate = nn.Sequential(
                 nn.Linear(output_dim * 2, output_dim),
+                nn.LayerNorm(output_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(output_dim, output_dim),
                 nn.Sigmoid(),
             )
             self.norm = nn.LayerNorm(output_dim)
+
+            if use_se:
+                self.se = SqueezeExcitation(output_dim)
+
+        elif fusion_type == "bilinear":
+            # 새로 추가: Bilinear Fusion
+            # 두 특징 간의 곱셈적 상호작용을 캡처
+            self.facenet_proj = nn.Sequential(
+                nn.Linear(facenet_dim, output_dim),
+                nn.LayerNorm(output_dim),
+            )
+            self.cnn_proj = nn.Sequential(
+                nn.Linear(cnn_dim, output_dim),
+                nn.LayerNorm(output_dim),
+            )
+
+            # Bilinear 레이어
+            self.bilinear = nn.Bilinear(output_dim, output_dim, output_dim)
+
+            # 추가 프로젝션
+            self.output_proj = nn.Sequential(
+                nn.LayerNorm(output_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(output_dim, output_dim),
+                nn.LayerNorm(output_dim),
+            )
+
+            if use_se:
+                self.se = SqueezeExcitation(output_dim)
 
         else:
             raise ValueError(f"지원하지 않는 fusion_type: {fusion_type}")
@@ -106,6 +239,7 @@ class FeatureFusion(nn.Module):
         print(f"  - FaceNet 차원: {facenet_dim}")
         print(f"  - CNN 차원: {cnn_dim}")
         print(f"  - 출력 차원: {output_dim}")
+        print(f"  - SE 블록: {'사용' if use_se else '미사용'}")
 
     def forward(
         self, facenet_features: torch.Tensor, cnn_features: torch.Tensor
@@ -123,16 +257,30 @@ class FeatureFusion(nn.Module):
         if self.fusion_type == "concat":
             combined = torch.cat([facenet_features, cnn_features], dim=1)
             output = self.projection(combined)
+            if self.use_se:
+                output = self.se(output)
 
         elif self.fusion_type == "attention":
-            facenet_proj = self.facenet_proj(facenet_features).unsqueeze(1)
-            cnn_proj = self.cnn_proj(cnn_features).unsqueeze(1)
+            facenet_proj = self.facenet_proj(facenet_features).unsqueeze(1)  # [B, 1, D]
+            cnn_proj = self.cnn_proj(cnn_features).unsqueeze(1)  # [B, 1, D]
 
-            # FaceNet을 query, CNN을 key/value로 사용
-            attn_out, _ = self.attention(facenet_proj, cnn_proj, cnn_proj)
-            attn_out = attn_out.squeeze(1)
-            attn_out = self.norm(attn_out + facenet_proj.squeeze(1))
-            output = self.ffn(attn_out) + attn_out
+            # Concat for sequence
+            seq = torch.cat([facenet_proj, cnn_proj], dim=1)  # [B, 2, D]
+
+            # Self-attention
+            self_attn_out, _ = self.self_attention(seq, seq, seq)
+            seq = self.norm1(seq + self_attn_out)
+
+            # Cross attention: FaceNet attends to CNN
+            cross_attn_out, _ = self.cross_attention(facenet_proj, cnn_proj, cnn_proj)
+            attn_out = self.norm2(facenet_proj + cross_attn_out)
+
+            # FFN
+            ffn_out = self.ffn(attn_out.squeeze(1))
+            output = self.norm3(attn_out.squeeze(1) + ffn_out)
+
+            if self.use_se:
+                output = self.se(output)
 
         elif self.fusion_type == "weighted_sum":
             facenet_proj = self.facenet_proj(facenet_features)
@@ -140,6 +288,8 @@ class FeatureFusion(nn.Module):
             weights = F.softmax(self.weights, dim=0)
             output = weights[0] * facenet_proj + weights[1] * cnn_proj
             output = self.norm(output)
+            if self.use_se:
+                output = self.se(output)
 
         elif self.fusion_type == "gated":
             facenet_proj = self.facenet_proj(facenet_features)
@@ -148,6 +298,21 @@ class FeatureFusion(nn.Module):
             gate = self.gate(combined)
             output = gate * facenet_proj + (1 - gate) * cnn_proj
             output = self.norm(output)
+            if self.use_se:
+                output = self.se(output)
+
+        elif self.fusion_type == "bilinear":
+            facenet_proj = self.facenet_proj(facenet_features)
+            cnn_proj = self.cnn_proj(cnn_features)
+
+            # Bilinear interaction
+            bilinear_out = self.bilinear(facenet_proj, cnn_proj)
+
+            # Output projection with residual
+            output = self.output_proj(bilinear_out)
+
+            if self.use_se:
+                output = self.se(output)
 
         else:
             raise ValueError(f"지원하지 않는 fusion_type: {self.fusion_type}")
@@ -157,9 +322,10 @@ class FeatureFusion(nn.Module):
 
 class ClassificationHead(nn.Module):
     """
-    분류 헤드
+    분류 헤드 (개선된 버전)
 
     특징 벡터를 받아 클래스 확률을 출력합니다.
+    더 깊은 네트워크와 Residual 연결을 지원합니다.
     """
 
     def __init__(
@@ -168,6 +334,7 @@ class ClassificationHead(nn.Module):
         hidden_dims: Optional[List[int]] = None,
         num_classes: int = 7,
         dropout: float = 0.3,
+        use_residual: bool = True,
     ):
         """
         Args:
@@ -175,35 +342,46 @@ class ClassificationHead(nn.Module):
             hidden_dims: 히든 레이어 차원 리스트
             num_classes: 출력 클래스 수
             dropout: 드롭아웃 비율
+            use_residual: Residual 연결 사용 여부
         """
         super().__init__()
 
         if hidden_dims is None:
             hidden_dims = [256, 128]
 
-        layers = []
-        prev_dim = input_dim
+        self.use_residual = use_residual
+        self.hidden_dims = hidden_dims
 
+        # 레이어 구성
+        self.layers = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        self.dropouts = nn.ModuleList()
+
+        # Residual projection (차원이 다를 때)
+        self.residual_projs = nn.ModuleList()
+
+        prev_dim = input_dim
         for hidden_dim in hidden_dims:
-            layers.extend(
-                [
-                    nn.Linear(prev_dim, hidden_dim),
-                    nn.LayerNorm(hidden_dim),
-                    nn.ReLU(inplace=True),
-                    nn.Dropout(dropout),
-                ]
-            )
+            self.layers.append(nn.Linear(prev_dim, hidden_dim))
+            self.norms.append(nn.LayerNorm(hidden_dim))
+            self.dropouts.append(nn.Dropout(dropout))
+
+            # Residual projection
+            if use_residual and prev_dim != hidden_dim:
+                self.residual_projs.append(nn.Linear(prev_dim, hidden_dim))
+            else:
+                self.residual_projs.append(None)
+
             prev_dim = hidden_dim
 
         # 최종 분류 레이어
-        layers.append(nn.Linear(prev_dim, num_classes))
+        self.classifier = nn.Linear(prev_dim, num_classes)
 
-        self.classifier = nn.Sequential(*layers)
-
-        print("ClassificationHead 초기화:")
+        print("ClassificationHead 초기화 (개선 버전):")
         print(f"  - 입력 차원: {input_dim}")
         print(f"  - 히든 차원: {hidden_dims}")
         print(f"  - 클래스 수: {num_classes}")
+        print(f"  - Residual 연결: {'사용' if use_residual else '미사용'}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -213,6 +391,23 @@ class ClassificationHead(nn.Module):
         Returns:
             로짓 [B, num_classes]
         """
+        for i, (layer, norm, drop) in enumerate(
+            zip(self.layers, self.norms, self.dropouts)
+        ):
+            residual = x
+
+            # Forward
+            x = layer(x)
+            x = norm(x)
+            x = F.gelu(x)
+            x = drop(x)
+
+            # Residual connection
+            if self.use_residual:
+                if self.residual_projs[i] is not None:
+                    residual = self.residual_projs[i](residual)
+                x = x + residual * 0.1  # Scaled residual
+
         return self.classifier(x)
 
 
@@ -247,6 +442,7 @@ class HybridEmotionModel(nn.Module):
         use_facenet_branch: bool = True,
         facenet_input_dim: int = 512,  # 사전 추출된 벡터 차원
         facenet_feature_dim: int = 512,
+        facenet_num_blocks: int = 4,  # FaceNet Projector 블록 수
         # CNN 설정
         use_cnn_branch: bool = True,
         cnn_backbone: str = "resnet18",
@@ -258,10 +454,12 @@ class HybridEmotionModel(nn.Module):
         fusion_type: str = "concat",
         fusion_output_dim: int = 256,
         attention_heads: int = 4,
+        use_se: bool = True,
         # Classification 설정
         num_classes: int = 7,
         classifier_hidden_dims: Optional[List[int]] = None,
         dropout: float = 0.3,
+        use_classifier_residual: bool = True,
         # 기타
         device: Optional[torch.device] = None,
     ):
@@ -270,6 +468,7 @@ class HybridEmotionModel(nn.Module):
             use_facenet_branch: FaceNet 브랜치 사용 여부
             facenet_input_dim: 사전 추출된 FaceNet 벡터 차원
             facenet_feature_dim: FaceNet projection 출력 차원
+            facenet_num_blocks: FaceNet Projector의 Residual 블록 수
 
             use_cnn_branch: CNN 브랜치 사용 여부
             cnn_backbone: CNN 백본 이름
@@ -281,10 +480,12 @@ class HybridEmotionModel(nn.Module):
             fusion_type: 특징 융합 방식
             fusion_output_dim: 융합 출력 차원
             attention_heads: 어텐션 헤드 수
+            use_se: Squeeze-and-Excitation 사용 여부
 
             num_classes: 클래스 수
             classifier_hidden_dims: 분류기 히든 레이어 차원
             dropout: 드롭아웃 비율
+            use_classifier_residual: 분류기에서 Residual 연결 사용
             device: 연산 디바이스
         """
         super().__init__()
@@ -303,7 +504,7 @@ class HybridEmotionModel(nn.Module):
             raise ValueError("최소 하나의 브랜치 (FaceNet 또는 CNN)가 필요합니다.")
 
         print("=" * 60)
-        print("HybridEmotionModel 초기화")
+        print("HybridEmotionModel 초기화 (개선 버전)")
         print("=" * 60)
 
         # FaceNet Branch (사전 추출된 벡터를 projection)
@@ -312,9 +513,12 @@ class HybridEmotionModel(nn.Module):
             self.facenet_branch = FaceNetFeatureProjector(
                 input_dim=facenet_input_dim,
                 feature_dim=facenet_feature_dim,
+                num_blocks=facenet_num_blocks,
                 dropout=dropout,
             )
-            print("\nFaceNet Branch: FaceNetFeatureProjector")
+            print(
+                f"\nFaceNet Branch: FaceNetFeatureProjector ({facenet_num_blocks} blocks)"
+            )
             print(f"  - 입력 차원: {facenet_input_dim}")
             print(f"  - 출력 차원: {facenet_feature_dim}")
         else:
@@ -351,6 +555,7 @@ class HybridEmotionModel(nn.Module):
                 fusion_type=fusion_type,
                 attention_heads=attention_heads,
                 dropout=dropout,
+                use_se=use_se,
             )
             classifier_input_dim = fusion_output_dim
         else:
@@ -365,6 +570,7 @@ class HybridEmotionModel(nn.Module):
             hidden_dims=classifier_hidden_dims,
             num_classes=num_classes,
             dropout=dropout,
+            use_residual=use_classifier_residual,
         )
 
         # 모델 정보 저장
@@ -373,6 +579,7 @@ class HybridEmotionModel(nn.Module):
             "use_cnn_branch": use_cnn_branch,
             "facenet_input_dim": facenet_input_dim if use_facenet_branch else 0,
             "facenet_feature_dim": facenet_feature_dim,
+            "facenet_num_blocks": facenet_num_blocks if use_facenet_branch else 0,
             "cnn_feature_dim": cnn_feature_dim,
             "fusion_type": fusion_type if self.fusion else "none",
             "num_classes": num_classes,
@@ -382,17 +589,18 @@ class HybridEmotionModel(nn.Module):
         print(f"  - FaceNet 브랜치: {'활성' if use_facenet_branch else '비활성'}")
         print(f"  - CNN 브랜치: {'활성' if use_cnn_branch else '비활성'}")
         print(f"  - 융합 방식: {fusion_type if self.fusion else 'N/A'}")
+        print(f"  - SE 블록: {'사용' if use_se else '미사용'}")
         print(f"  - 클래스 수: {num_classes}")
         print(f"  - 총 파라미터: {self._count_params():,}")
         print(f"  - 학습 가능 파라미터: {self._count_trainable_params():,}")
         print("=" * 60)
 
     def _count_params(self) -> int:
-        """전체 파라미터 수"""
+        """총 파라미터 수 반환"""
         return sum(p.numel() for p in self.parameters())
 
     def _count_trainable_params(self) -> int:
-        """학습 가능 파라미터 수"""
+        """학습 가능한 파라미터 수 반환"""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     def forward(
@@ -468,19 +676,18 @@ class HybridEmotionModel(nn.Module):
 
         Args:
             image: 입력 이미지 [B, C, H, W]
-            facenet_vector: 사전 추출된 FaceNet 특징
+            facenet_vector: FaceNet 벡터 [B, facenet_input_dim]
 
         Returns:
-            (예측 클래스 [B], 확률 [B, num_classes])
+            (predicted_classes, probabilities)
         """
         self.eval()
         with torch.no_grad():
             outputs = self.forward(image, facenet_vector)
             logits = outputs["logits"]
             probs = F.softmax(logits, dim=1)
-            predictions = torch.argmax(probs, dim=1)
-
-        return predictions, probs
+            preds = torch.argmax(probs, dim=1)
+        return preds, probs
 
     def get_features(
         self,
@@ -488,145 +695,170 @@ class HybridEmotionModel(nn.Module):
         facenet_vector: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        특징만 추출 (분류 제외)
+        중간 특징 추출
 
         Args:
             image: 입력 이미지 [B, C, H, W]
-            facenet_vector: 사전 추출된 FaceNet 특징
+            facenet_vector: FaceNet 벡터 [B, facenet_input_dim]
 
         Returns:
-            특징 딕셔너리
+            각 브랜치의 특징을 포함하는 딕셔너리
         """
-        outputs: Dict[str, torch.Tensor] = {}
-
+        self.eval()
         with torch.no_grad():
-            if self.use_facenet_branch and self.facenet_branch is not None:
-                if facenet_vector is not None:
-                    outputs["facenet_features"] = self.facenet_branch(facenet_vector)
+            outputs = self.forward(image, facenet_vector)
 
-            if self.use_cnn_branch and self.cnn_branch is not None:
-                outputs["cnn_features"] = self.cnn_branch(image)
+        features = {}
+        if "facenet_features" in outputs:
+            features["facenet"] = outputs["facenet_features"]
+        if "cnn_features" in outputs:
+            features["cnn"] = outputs["cnn_features"]
+        if "fused_features" in outputs:
+            features["fused"] = outputs["fused_features"]
 
-            if (
-                self.fusion is not None
-                and "facenet_features" in outputs
-                and "cnn_features" in outputs
-            ):
-                outputs["fused_features"] = self.fusion(
-                    outputs["facenet_features"], outputs["cnn_features"]
-                )
-
-        return outputs
+        return features
 
 
 class HybridEmotionModelLite(nn.Module):
     """
-    경량 하이브리드 모델 (CNN만 사용)
+    경량 하이브리드 감정 분류 모델
 
-    FaceNet 벡터 없이 CNN만으로 감정을 분류합니다.
-    단일 이미지 예측이나 빠른 테스트에 적합합니다.
+    추론 속도가 중요한 경우 사용합니다.
+    FaceNet 벡터만 사용하여 빠른 예측을 수행합니다.
     """
 
     def __init__(
         self,
-        backbone: str = "resnet18",
-        feature_dim: int = 512,
+        input_dim: int = 512,
+        hidden_dims: Optional[List[int]] = None,
         num_classes: int = 7,
-        pretrained: bool = True,
         dropout: float = 0.3,
     ):
         super().__init__()
 
-        self.cnn = CNNFeatureExtractor(
-            backbone=backbone,
-            feature_dim=feature_dim,
-            pretrained=pretrained,
-            dropout=dropout,
-        )
+        if hidden_dims is None:
+            hidden_dims = [256, 128]
 
-        self.classifier = ClassificationHead(
-            input_dim=feature_dim,
-            hidden_dims=[256, 128],
-            num_classes=num_classes,
-            dropout=dropout,
-        )
+        layers = []
+        prev_dim = input_dim
 
-        self.use_facenet_branch = False
-        self.use_cnn_branch = True
+        for hidden_dim in hidden_dims:
+            layers.extend(
+                [
+                    nn.Linear(prev_dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                ]
+            )
+            prev_dim = hidden_dim
 
-    def forward(
-        self,
-        image: torch.Tensor,
-        facenet_vector: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
-        """순전파 (facenet_vector는 무시됨)"""
-        features = self.cnn(image)
-        logits = self.classifier(features)
-        return {"logits": logits, "cnn_features": features}
+        layers.append(nn.Linear(prev_dim, num_classes))
+        self.classifier = nn.Sequential(*layers)
+
+    def forward(self, facenet_vector: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            facenet_vector: FaceNet 벡터 [B, input_dim]
+
+        Returns:
+            로짓 [B, num_classes]
+        """
+        return self.classifier(facenet_vector)
 
     def predict(
-        self,
-        image: torch.Tensor,
-        facenet_vector: Optional[torch.Tensor] = None,
+        self, facenet_vector: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """예측"""
+        """예측 수행"""
         self.eval()
         with torch.no_grad():
-            outputs = self.forward(image)
-            logits = outputs["logits"]
+            logits = self.forward(facenet_vector)
             probs = F.softmax(logits, dim=1)
-            predictions = torch.argmax(probs, dim=1)
-        return predictions, probs
+            preds = torch.argmax(probs, dim=1)
+        return preds, probs
 
 
 # 테스트 코드
 if __name__ == "__main__":
     print("=" * 60)
-    print("Hybrid Emotion Model 테스트")
+    print("Hybrid Emotion Model 테스트 (개선 버전)")
     print("=" * 60)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
 
     # 더미 입력
     batch_size = 4
-    dummy_image = torch.randn(batch_size, 3, 224, 224)
-    dummy_facenet = torch.randn(batch_size, 512)
-    dummy_facenet = F.normalize(dummy_facenet, p=2, dim=1)  # L2 정규화
+    dummy_image = torch.randn(batch_size, 3, 224, 224).to(device)
+    dummy_facenet = torch.randn(batch_size, 512).to(device)
+    dummy_facenet = F.normalize(dummy_facenet, p=2, dim=1)
 
-    # 하이브리드 모델 테스트
-    print("\n[1] HybridEmotionModel 테스트 (FaceNet + CNN)")
+    print("\n[1] 기본 HybridEmotionModel 테스트 (concat)")
     model = HybridEmotionModel(
         use_facenet_branch=True,
-        facenet_input_dim=512,
-        facenet_feature_dim=512,
         use_cnn_branch=True,
+        fusion_type="concat",
         cnn_backbone="resnet18",
         cnn_pretrained=False,
-        fusion_type="concat",
-        num_classes=7,
-    )
-    outputs = model(dummy_image, facenet_vector=dummy_facenet)
-    print(f"  - Logits shape: {outputs['logits'].shape}")
-    print(f"  - FaceNet features shape: {outputs['facenet_features'].shape}")
-    print(f"  - CNN features shape: {outputs['cnn_features'].shape}")
+    ).to(device)
 
-    # FaceNet만 사용
-    print("\n[2] FaceNet만 사용")
+    outputs = model(dummy_image, dummy_facenet)
+    print(f"  - Logits shape: {outputs['logits'].shape}")
+
+    print("\n[2] Attention Fusion 테스트")
+    model_attn = HybridEmotionModel(
+        use_facenet_branch=True,
+        use_cnn_branch=True,
+        fusion_type="attention",
+        cnn_backbone="resnet18",
+        cnn_pretrained=False,
+    ).to(device)
+
+    outputs_attn = model_attn(dummy_image, dummy_facenet)
+    print(f"  - Logits shape: {outputs_attn['logits'].shape}")
+
+    print("\n[3] Bilinear Fusion 테스트")
+    model_bilinear = HybridEmotionModel(
+        use_facenet_branch=True,
+        use_cnn_branch=True,
+        fusion_type="bilinear",
+        cnn_backbone="resnet18",
+        cnn_pretrained=False,
+    ).to(device)
+
+    outputs_bilinear = model_bilinear(dummy_image, dummy_facenet)
+    print(f"  - Logits shape: {outputs_bilinear['logits'].shape}")
+
+    print("\n[4] Gated Fusion 테스트")
+    model_gated = HybridEmotionModel(
+        use_facenet_branch=True,
+        use_cnn_branch=True,
+        fusion_type="gated",
+        cnn_backbone="resnet18",
+        cnn_pretrained=False,
+    ).to(device)
+
+    outputs_gated = model_gated(dummy_image, dummy_facenet)
+    print(f"  - Logits shape: {outputs_gated['logits'].shape}")
+
+    print("\n[5] FaceNet Only 테스트")
     model_facenet = HybridEmotionModel(
         use_facenet_branch=True,
-        facenet_input_dim=512,
         use_cnn_branch=False,
-        num_classes=7,
-    )
-    outputs_facenet = model_facenet(dummy_image, facenet_vector=dummy_facenet)
+        cnn_pretrained=False,
+    ).to(device)
+
+    outputs_facenet = model_facenet(dummy_image, dummy_facenet)
     print(f"  - Logits shape: {outputs_facenet['logits'].shape}")
 
-    # CNN만 사용
-    print("\n[3] CNN만 사용 (Lite 모델)")
-    model_lite = HybridEmotionModelLite(
-        backbone="resnet18",
-        num_classes=7,
-        pretrained=False,
-    )
-    outputs_lite = model_lite(dummy_image)
-    print(f"  - Logits shape: {outputs_lite['logits'].shape}")
+    print("\n[6] Prediction 테스트")
+    preds, probs = model.predict(dummy_image, dummy_facenet)
+    print(f"  - Predictions: {preds}")
+    print(f"  - Probabilities shape: {probs.shape}")
+
+    print("\n[7] Lite Model 테스트")
+    model_lite = HybridEmotionModelLite().to(device)
+    preds_lite, probs_lite = model_lite.predict(dummy_facenet)
+    print(f"  - Predictions: {preds_lite}")
 
     print("\n테스트 완료!")

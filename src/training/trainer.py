@@ -10,7 +10,6 @@ Trainer Module for Hybrid Emotion Classification
 # pyright: reportAttributeAccessIssue=false
 # pyright: reportArgumentType=false
 
-import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -25,44 +24,12 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard.writer import SummaryWriter
 from tqdm import tqdm
 
-# ============================================================
-# CUDA 최적화 함수
-# ============================================================
-
-
-def check_cuda_available() -> bool:
-    """CUDA 사용 가능 여부 확인"""
-    return torch.cuda.is_available()
-
-
-def setup_cuda_optimization():
-    """CUDA 최적화 설정"""
-    if not check_cuda_available():
-        return
-
-    # cuDNN 최적화 활성화
-    torch.backends.cudnn.enabled = True
-    torch.backends.cudnn.benchmark = True  # 입력 크기가 일정할 때 성능 향상
-
-    # TF32 활성화 (Ampere 이상 GPU에서 성능 향상)
-    if hasattr(torch.backends.cuda, "matmul"):
-        torch.backends.cuda.matmul.allow_tf32 = True
-    if hasattr(torch.backends.cudnn, "allow_tf32"):
-        torch.backends.cudnn.allow_tf32 = True
-
-    # 메모리 단편화 방지
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
-
-def print_cuda_info():
-    """CUDA 정보 출력"""
-    if check_cuda_available():
-        print(f"  - CUDA: ✓ ({torch.cuda.get_device_name(0)})")
-        print(f"  - cuDNN: {torch.backends.cudnn.version()}")
-        print("  - AMP 지원: ✓")
-    else:
-        print("  - CUDA: ✗ (CPU 모드)")
-        print("  - AMP 지원: ✗")
+# CUDA 유틸리티 import
+from util.cuda import (
+    check_cuda_available,
+    print_cuda_info,
+    setup_cuda_optimization,
+)
 
 
 class EarlyStopping:
@@ -146,8 +113,8 @@ class MetricTracker:
         self.batch_count = 0
 
         # 클래스별 통계
-        self.class_correct = {}
-        self.class_total = {}
+        self.class_correct: Dict[int, int] = {}
+        self.class_total: Dict[int, int] = {}
 
     def update(
         self,
@@ -188,7 +155,7 @@ class MetricTracker:
         accuracy = 100.0 * self.correct / max(self.total, 1)
 
         # 클래스별 정확도
-        class_acc: Dict[Any, float] = {}
+        class_acc: Dict[int, float] = {}
         for label in self.class_total:
             class_acc[label] = (
                 100.0
@@ -208,6 +175,7 @@ class Trainer:
     모델 학습 클래스
 
     학습, 검증, 체크포인트 저장 등을 담당합니다.
+    실시간 plotting 기능을 지원합니다.
     """
 
     def __init__(
@@ -238,6 +206,10 @@ class Trainer:
         class_weights: Optional[torch.Tensor] = None,
         # 추가 정보
         class_names: Optional[List[str]] = None,
+        # 실시간 Plotting 설정
+        live_plot: bool = False,
+        plot_update_interval: int = 1,
+        plot_save_dir: Optional[Path] = None,
     ):
         """
         Args:
@@ -260,6 +232,9 @@ class Trainer:
             early_stopping_patience: 조기 종료 patience
             class_weights: 클래스 가중치 (불균형 처리)
             class_names: 클래스 이름 리스트
+            live_plot: 실시간 플롯 사용 여부
+            plot_update_interval: 플롯 업데이트 간격 (에폭 단위)
+            plot_save_dir: 플롯 저장 디렉토리
         """
         self.model = model
         self.train_loader = train_loader
@@ -268,6 +243,7 @@ class Trainer:
         self.log_interval = log_interval
         self.save_best_only = save_best_only
         self.class_names = class_names or []
+        self.experiment_name = experiment_name
 
         # 디바이스 설정
         self.device = device or torch.device(
@@ -335,7 +311,7 @@ class Trainer:
         )
 
         # 학습 기록
-        self.history = {
+        self.history: Dict[str, List[float]] = {
             "train_loss": [],
             "train_acc": [],
             "val_loss": [],
@@ -346,6 +322,17 @@ class Trainer:
         self.best_val_acc = 0.0
         self.current_epoch = 0
 
+        # 실시간 Plotting 설정
+        self.live_plot = live_plot
+        self.plot_update_interval = plot_update_interval
+        self.plot_save_dir = (
+            Path(plot_save_dir) if plot_save_dir else self.checkpoint_dir
+        )
+        self.live_plotter = None
+
+        if self.live_plot:
+            self._setup_live_plotter()
+
         print("\nTrainer 초기화 완료:")
         print(f"  - 디바이스: {self.device}")
         print_cuda_info()
@@ -354,6 +341,42 @@ class Trainer:
         print(f"  - AMP (Mixed Precision): {self.use_amp}")
         print(f"  - 학습 배치 수: {len(train_loader)}")
         print(f"  - 검증 배치 수: {len(val_loader)}")
+        print(f"  - 실시간 Plotting: {'✓' if self.live_plot else '✗'}")
+
+    def _setup_live_plotter(self):
+        """실시간 플로터 설정"""
+        try:
+            from util.plotting import LivePlotter
+
+            self.live_plotter = LivePlotter(
+                num_epochs=self.num_epochs,
+                class_names=self.class_names,
+                figsize=(14, 10),
+                save_dir=self.plot_save_dir,
+                experiment_name=self.experiment_name,
+                update_interval=self.plot_update_interval,
+                show_plot=True,
+            )
+            print("  - LivePlotter 초기화 완료")
+        except ImportError as e:
+            print(f"  - LivePlotter 초기화 실패: {e}")
+            print("    matplotlib가 설치되어 있는지 확인하세요.")
+            self.live_plot = False
+            self.live_plotter = None
+
+    def _get_feature_vector(self, batch: Dict) -> Optional[torch.Tensor]:
+        """
+        배치에서 FaceNet 벡터 추출
+
+        Args:
+            batch: 배치 딕셔너리
+
+        Returns:
+            특징 벡터 텐서 또는 None
+        """
+        if "facenet_vector" in batch:
+            return batch["facenet_vector"].to(self.device, non_blocking=True)
+        return None
 
     def train_one_epoch(self) -> Dict[str, float]:
         """
@@ -376,17 +399,15 @@ class Trainer:
             images = batch["image"].to(self.device, non_blocking=True)
             labels = batch["label"].to(self.device, non_blocking=True)
 
-            # YOLO 벡터 (있는 경우)
-            yolo_vector = None
-            if "yolo_vector" in batch:
-                yolo_vector = batch["yolo_vector"].to(self.device, non_blocking=True)
+            # FaceNet/YOLO 벡터 (있는 경우)
+            feature_vector = self._get_feature_vector(batch)
 
             # Forward pass
             self.optimizer.zero_grad()
 
             if self.use_amp and self.scaler is not None:
                 with torch.autocast(device_type="cuda"):
-                    outputs = self.model(images, yolo_vector)
+                    outputs = self.model(images, facenet_vector=feature_vector)
                     logits = outputs["logits"]
                     loss = self.criterion(logits, labels)
 
@@ -395,7 +416,7 @@ class Trainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                outputs = self.model(images, yolo_vector)
+                outputs = self.model(images, facenet_vector=feature_vector)
                 logits = outputs["logits"]
                 loss = self.criterion(logits, labels)
 
@@ -447,19 +468,17 @@ class Trainer:
             images = batch["image"].to(self.device, non_blocking=True)
             labels = batch["label"].to(self.device, non_blocking=True)
 
-            # YOLO 벡터 (있는 경우)
-            yolo_vector = None
-            if "yolo_vector" in batch:
-                yolo_vector = batch["yolo_vector"].to(self.device, non_blocking=True)
+            # FaceNet/YOLO 벡터 (있는 경우)
+            feature_vector = self._get_feature_vector(batch)
 
             # Forward pass
             if self.use_amp:
                 with torch.autocast(device_type="cuda"):
-                    outputs = self.model(images, yolo_vector)
+                    outputs = self.model(images, facenet_vector=feature_vector)
                     logits = outputs["logits"]
                     loss = self.criterion(logits, labels)
             else:
-                outputs = self.model(images, yolo_vector)
+                outputs = self.model(images, facenet_vector=feature_vector)
                 logits = outputs["logits"]
                 loss = self.criterion(logits, labels)
 
@@ -491,104 +510,129 @@ class Trainer:
 
         start_time = time.time()
 
-        for epoch in range(self.num_epochs):
-            self.current_epoch = epoch
-            epoch_start = time.time()
+        try:
+            for epoch in range(self.num_epochs):
+                self.current_epoch = epoch
+                epoch_start = time.time()
 
-            print(f"\nEpoch [{epoch + 1}/{self.num_epochs}]")
-            print("-" * 40)
+                print(f"\nEpoch [{epoch + 1}/{self.num_epochs}]")
+                print("-" * 40)
 
-            # 학습
-            train_metrics = self.train_one_epoch()
+                # 학습
+                train_metrics = self.train_one_epoch()
 
-            # 검증
-            val_metrics = self.validate()
+                # 검증
+                val_metrics = self.validate()
 
-            # 스케줄러 업데이트
-            if self.scheduler is not None:
-                self.scheduler.step()
+                # 스케줄러 업데이트
+                if self.scheduler is not None:
+                    self.scheduler.step()
 
-            # 현재 학습률
-            current_lr = self.optimizer.param_groups[0]["lr"]
+                # 현재 학습률
+                current_lr = self.optimizer.param_groups[0]["lr"]
 
-            # 히스토리 기록
-            self.history["train_loss"].append(train_metrics["loss"])
-            self.history["train_acc"].append(train_metrics["accuracy"])
-            self.history["val_loss"].append(val_metrics["loss"])
-            self.history["val_acc"].append(val_metrics["accuracy"])
-            self.history["learning_rate"].append(current_lr)
+                # 히스토리 기록
+                self.history["train_loss"].append(train_metrics["loss"])
+                self.history["train_acc"].append(train_metrics["accuracy"])
+                self.history["val_loss"].append(val_metrics["loss"])
+                self.history["val_acc"].append(val_metrics["accuracy"])
+                self.history["learning_rate"].append(current_lr)
 
-            # 에폭 시간
-            epoch_time = time.time() - epoch_start
+                # 에폭 시간
+                epoch_time = time.time() - epoch_start
 
-            # 결과 출력
-            print(
-                f"Train Loss: {train_metrics['loss']:.4f} | "
-                f"Train Acc: {train_metrics['accuracy']:.2f}%"
-            )
-            print(
-                f"Val Loss: {val_metrics['loss']:.4f} | "
-                f"Val Acc: {val_metrics['accuracy']:.2f}%"
-            )
-            print(f"Learning Rate: {current_lr:.6f} | Time: {epoch_time:.1f}s")
+                # 결과 출력
+                print(
+                    f"Train Loss: {train_metrics['loss']:.4f} | "
+                    f"Train Acc: {train_metrics['accuracy']:.2f}%"
+                )
+                print(
+                    f"Val Loss: {val_metrics['loss']:.4f} | "
+                    f"Val Acc: {val_metrics['accuracy']:.2f}%"
+                )
+                print(f"Learning Rate: {current_lr:.6f} | Time: {epoch_time:.1f}s")
 
-            # 클래스별 정확도 출력
-            class_accuracy = val_metrics.get("class_accuracy")
-            if self.class_names and class_accuracy and isinstance(class_accuracy, dict):
-                print("클래스별 Val 정확도:")
-                for idx, acc in class_accuracy.items():
-                    class_name = (
-                        self.class_names[idx]
-                        if idx < len(self.class_names)
-                        else f"Class {idx}"
+                # 클래스별 정확도 출력
+                class_accuracy = val_metrics.get("class_accuracy")
+                if (
+                    self.class_names
+                    and class_accuracy
+                    and isinstance(class_accuracy, dict)
+                ):
+                    print("클래스별 Val 정확도:")
+                    for idx, acc in class_accuracy.items():
+                        class_name = (
+                            self.class_names[idx]
+                            if idx < len(self.class_names)
+                            else f"Class {idx}"
+                        )
+                        print(f"  {class_name}: {acc:.2f}%")
+
+                # 실시간 Plotting 업데이트
+                if self.live_plot and self.live_plotter is not None:
+                    self.live_plotter.update(
+                        epoch=epoch,
+                        train_metrics=train_metrics,
+                        val_metrics=val_metrics,
+                        learning_rate=current_lr,
                     )
-                    print(f"  {class_name}: {acc:.2f}%")
 
-            # TensorBoard 에폭 로깅
+                # TensorBoard 에폭 로깅
+                if self.writer:
+                    self.writer.add_scalars(
+                        "Epoch/Loss",
+                        {"train": train_metrics["loss"], "val": val_metrics["loss"]},
+                        epoch + 1,
+                    )
+                    self.writer.add_scalars(
+                        "Epoch/Accuracy",
+                        {
+                            "train": train_metrics["accuracy"],
+                            "val": val_metrics["accuracy"],
+                        },
+                        epoch + 1,
+                    )
+                    self.writer.add_scalar("Epoch/Learning_Rate", current_lr, epoch + 1)
+
+                # 최고 성능 체크포인트 저장
+                if val_metrics["accuracy"] > self.best_val_acc:
+                    self.best_val_acc = val_metrics["accuracy"]
+                    if self.checkpoint_dir:
+                        self.save_checkpoint("best_model.pth")
+                        print(
+                            f"최고 성능 모델 저장됨 (Val Acc: {self.best_val_acc:.2f}%)"
+                        )
+
+                # Early stopping 체크
+                self.early_stopping(val_metrics["accuracy"])
+                if self.early_stopping.early_stop:
+                    print(f"\n조기 종료: {epoch + 1} 에폭에서 학습 중단")
+                    break
+
+        except KeyboardInterrupt:
+            print("\n\n학습이 사용자에 의해 중단되었습니다.")
+
+        finally:
+            # 최종 모델 저장
+            if self.checkpoint_dir and not self.save_best_only:
+                self.save_checkpoint("final_model.pth")
+
+            # 총 학습 시간
+            total_time = time.time() - start_time
+            print("\n" + "=" * 60)
+            print("학습 완료!")
+            print(f"  - 총 시간: {total_time / 60:.1f}분")
+            print(f"  - 최고 검증 정확도: {self.best_val_acc:.2f}%")
+            print("=" * 60)
+
+            # 실시간 플롯 저장 및 종료
+            if self.live_plot and self.live_plotter is not None:
+                self.live_plotter.save()
+                self.live_plotter.close()
+
+            # TensorBoard 종료
             if self.writer:
-                self.writer.add_scalars(
-                    "Epoch/Loss",
-                    {"train": train_metrics["loss"], "val": val_metrics["loss"]},
-                    epoch + 1,
-                )
-                self.writer.add_scalars(
-                    "Epoch/Accuracy",
-                    {
-                        "train": train_metrics["accuracy"],
-                        "val": val_metrics["accuracy"],
-                    },
-                    epoch + 1,
-                )
-                self.writer.add_scalar("Epoch/Learning_Rate", current_lr, epoch + 1)
-
-            # 최고 성능 체크포인트 저장
-            if val_metrics["accuracy"] > self.best_val_acc:
-                self.best_val_acc = val_metrics["accuracy"]
-                if self.checkpoint_dir:
-                    self.save_checkpoint("best_model.pth")
-                    print(f"최고 성능 모델 저장됨 (Val Acc: {self.best_val_acc:.2f}%)")
-
-            # Early stopping 체크
-            self.early_stopping(val_metrics["accuracy"])
-            if self.early_stopping.early_stop:
-                print(f"\n조기 종료: {epoch + 1} 에폭에서 학습 중단")
-                break
-
-        # 최종 모델 저장
-        if self.checkpoint_dir and not self.save_best_only:
-            self.save_checkpoint("final_model.pth")
-
-        # 총 학습 시간
-        total_time = time.time() - start_time
-        print("\n" + "=" * 60)
-        print("학습 완료!")
-        print(f"  - 총 시간: {total_time / 60:.1f}분")
-        print(f"  - 최고 검증 정확도: {self.best_val_acc:.2f}%")
-        print("=" * 60)
-
-        # TensorBoard 종료
-        if self.writer:
-            self.writer.close()
+                self.writer.close()
 
         return self.history
 
@@ -607,10 +651,11 @@ class Trainer:
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": (
-                self.scheduler.state_dict() if self.scheduler is not None else None  # type: ignore
+                self.scheduler.state_dict() if self.scheduler is not None else None
             ),
             "best_val_acc": self.best_val_acc,
             "history": self.history,
+            "class_names": self.class_names,
         }
 
         save_path = self.checkpoint_dir / filename
@@ -631,7 +676,7 @@ class Trainer:
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
         if self.scheduler is not None and checkpoint.get("scheduler_state_dict"):
-            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])  # type: ignore
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 
         self.current_epoch = checkpoint.get("epoch", 0)
         self.best_val_acc = checkpoint.get("best_val_acc", 0.0)
@@ -672,11 +717,14 @@ def evaluate_model(
             images = batch["image"].to(device, non_blocking=True)
             labels = batch["label"].to(device, non_blocking=True)
 
-            yolo_vector = None
-            if "yolo_vector" in batch:
-                yolo_vector = batch["yolo_vector"].to(device, non_blocking=True)
+            # FaceNet/YOLO 벡터 (있는 경우)
+            feature_vector = None
+            if "facenet_vector" in batch:
+                feature_vector = batch["facenet_vector"].to(device, non_blocking=True)
+            elif "yolo_vector" in batch:
+                feature_vector = batch["yolo_vector"].to(device, non_blocking=True)
 
-            outputs = model(images, yolo_vector)
+            outputs = model(images, facenet_vector=feature_vector)
             logits = outputs["logits"]
             probs = torch.softmax(logits, dim=1)
             predictions = torch.argmax(probs, dim=1)
@@ -721,21 +769,28 @@ def evaluate_model(
 
 # 테스트 코드
 if __name__ == "__main__":
+    print("=" * 50)
     print("Trainer 모듈 테스트")
+    print("=" * 50)
 
-    # 더미 데이터로 테스트
+    # 더미 모델
     class DummyModel(nn.Module):
-        def __init__(self, num_classes=6):
+        def __init__(self, num_classes: int = 7):
             super().__init__()
-            self.fc = nn.Linear(3 * 224 * 224, num_classes)
+            self.fc = nn.Linear(512, num_classes)
 
-        def forward(self, image, yolo_vector=None):
-            x = image.view(image.size(0), -1)
-            return {"logits": self.fc(x)}
+        def forward(self, image, facenet_vector=None, yolo_vector=None):
+            # 간단한 더미 forward
+            batch_size = image.size(0)
+            dummy_features = torch.randn(batch_size, 512, device=image.device)
+            logits = self.fc(dummy_features)
+            return {"logits": logits}
 
     # 더미 데이터셋
-    class DummyDataset(torch.utils.data.Dataset):
-        def __init__(self, size=100):
+    from torch.utils.data import Dataset
+
+    class DummyDataset(Dataset):
+        def __init__(self, size: int = 100):
             self.size = size
 
         def __len__(self):
@@ -744,22 +799,30 @@ if __name__ == "__main__":
         def __getitem__(self, idx):
             return {
                 "image": torch.randn(3, 224, 224),
-                "label": torch.tensor(idx % 6),
+                "label": torch.tensor(idx % 7),
+                "path": f"dummy_{idx}.jpg",
             }
 
-    # 데이터 로더 생성
-    train_dataset = DummyDataset(100)
-    val_dataset = DummyDataset(20)
+    def collate_fn(batch):
+        return {
+            "image": torch.stack([item["image"] for item in batch]),
+            "label": torch.stack([item["label"] for item in batch]),
+            "path": [item["path"] for item in batch],
+        }
 
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=16, shuffle=True
+    print("\n[테스트 설정]")
+    model = DummyModel()
+    train_dataset = DummyDataset(64)
+    val_dataset = DummyDataset(16)
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=8, shuffle=True, collate_fn=collate_fn
     )
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=16, shuffle=False)
+    val_loader = DataLoader(
+        val_dataset, batch_size=8, shuffle=False, collate_fn=collate_fn
+    )
 
-    # 모델 생성
-    model = DummyModel(num_classes=6)
-
-    # 트레이너 생성
+    # Trainer 테스트 (실시간 플롯 없이)
     trainer = Trainer(
         model=model,
         train_loader=train_loader,
@@ -767,14 +830,20 @@ if __name__ == "__main__":
         num_epochs=2,
         learning_rate=1e-3,
         use_amp=False,
-        class_names=["당황", "분노", "불안", "상처", "슬픔", "중립"],
+        class_names=["기쁨", "당황", "분노", "불안", "상처", "슬픔", "중립"],
+        live_plot=False,  # 테스트에서는 비활성화
     )
 
-    # 학습
+    print("\n[학습 테스트]")
     history = trainer.train()
 
-    print("\n학습 히스토리:")
-    print(f"  - Train Loss: {history['train_loss']}")
-    print(f"  - Val Acc: {history['val_acc']}")
+    print("\n[평가 테스트]")
+    metrics = evaluate_model(
+        model=model,
+        dataloader=val_loader,
+        device=trainer.device,
+        class_names=["기쁨", "당황", "분노", "불안", "상처", "슬픔", "중립"],
+    )
+    print(f"  - 정확도: {metrics['accuracy']:.2f}%")
 
     print("\n테스트 완료!")

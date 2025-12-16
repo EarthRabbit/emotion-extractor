@@ -33,21 +33,21 @@
 │                                    Classification Head              │
 │                                              │                      │
 │                                              ▼                      │
-│                            Emotion Class (6 classes)                │
+│                            Emotion Class (7 classes)                │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
 ## 🧬 왜 FaceNet인가?
 
-| 비교 항목 | YOLO 백본 | FaceNet |
-|----------|-----------|---------|
-| **설계 목적** | 물체 탐지 | 얼굴 인식 |
-| **출력 차원** | 256 | 512 |
-| **L2 정규화** | ❌ | ✅ |
-| **감정 인식 적합도** | 보통 (65-72%) | **우수 (75-82%)** |
-| **얼굴 특징 학습** | 간접적 | **직접적** |
-
 FaceNet은 얼굴의 미세한 특징을 구분하도록 학습되어, 표정 변화를 더 잘 포착합니다.
+
+| 특징 | 설명 |
+|------|------|
+| **설계 목적** | 얼굴 인식 |
+| **출력 차원** | 512 |
+| **L2 정규화** | ✅ |
+| **감정 인식 적합도** | **우수 (75-82%)** |
+| **얼굴 특징 학습** | **직접적** |
 
 ## ⚠️ 중요: FaceNet 벡터 전처리
 
@@ -103,10 +103,11 @@ uv run python src/data/extract_facenet_vectors.py \
 uv run python src/data/extract_facenet_vectors.py --check-device
 ```
 
-## 🎯 감정 클래스
+## 🎯 감정 클래스 (7개)
 
 | 한국어 | English | 설명 |
 |--------|---------|------|
+| 기쁨 | Joy | 기쁜 감정 |
 | 당황 | Embarrassed | 당황스러운 감정 |
 | 분노 | Angry | 화가 난 감정 |
 | 불안 | Anxious | 불안한 감정 |
@@ -138,6 +139,9 @@ uv run python src/data/extract_facenet_vectors.py --check-device
 - `tensorboard >= 2.0`
 - `pillow >= 11.0`
 - `tqdm >= 4.0`
+- `matplotlib` (실시간 플로팅)
+- `seaborn` (분석 시각화)
+- `scikit-learn` (분석 메트릭)
 
 ## 📖 사용법
 
@@ -155,6 +159,12 @@ uv run python src/data/extract_facenet_vectors.py --data-root ./data/cropped/ima
 ```bash
 # 기본 학습 (FaceNet + CNN)
 uv run python src/pipeline.py --mode train
+
+# 실시간 플롯과 함께 학습
+uv run python src/pipeline.py --mode train --live-plot
+
+# 학습 후 분석 리포트 생성
+uv run python src/pipeline.py --mode train --analysis
 
 # CNN만 사용 (FaceNet 벡터 불필요)
 uv run python src/pipeline.py --mode train --no-facenet
@@ -181,6 +191,10 @@ uv run python src/pipeline.py --mode test
 ```bash
 uv run python src/pipeline.py --mode eval \
     --checkpoint checkpoints/best_model.pth
+
+# 평가 + 분석 리포트
+uv run python src/pipeline.py --mode eval \
+    --checkpoint checkpoints/best_model.pth --analysis
 ```
 
 ### 3. 예측 (Prediction)
@@ -196,7 +210,7 @@ uv run python src/pipeline.py --mode predict \
 
 | 옵션 | 설명 | 기본값 |
 |------|------|--------|
-| `--mode` | 실행 모드 (train/eval/predict/test) | - |
+| `--mode` | 실행 모드 (train/eval/predict/test/check-cuda) | - |
 | `--epochs` | 학습 에폭 수 | 30 |
 | `--batch-size` | 배치 크기 | 32 |
 | `--lr` | 학습률 | 0.0001 |
@@ -209,6 +223,8 @@ uv run python src/pipeline.py --mode predict \
 | `--image` | 예측할 이미지 경로 | - |
 | `--name` | 실험 이름 | auto |
 | `--light` | 경량 설정 사용 | False |
+| `--live-plot` | 학습 중 실시간 그래프 표시 | False |
+| `--analysis` | 학습/평가 후 분석 리포트 생성 | False |
 
 ## 🔧 모델 구성
 
@@ -231,7 +247,7 @@ uv run python src/pipeline.py --mode predict \
 
 ### Classification Head
 - Multi-layer MLP with LayerNorm, Dropout
-- 6 클래스 출력
+- 7 클래스 출력
 
 ## ⚡ 성능 최적화
 
@@ -271,11 +287,13 @@ emotion-extractor/
 │   │   └── trainer.py         # Trainer, evaluate_model
 │   │
 │   └── util/
-│       └── plotting.py        # 시각화 유틸리티
+│       ├── plotting.py        # 실시간 플로팅 및 시각화
+│       └── analysis.py        # 분석 및 평가 도구
 │
 ├── data/
 │   └── cropped/
 │       ├── images/            # 클래스별 이미지 폴더
+│       │   ├── 기쁨/
 │       │   ├── 당황/
 │       │   ├── 분노/
 │       │   ├── 불안/
@@ -304,13 +322,14 @@ emotion-extractor/
     "feature_dim": 512,
     "image_size": 160,
     "num_images": 5000,
-    "classes": ["당황", "분노", "불안", "상처", "슬픔", "중립"],
+    "classes": ["기쁨", "당황", "분노", "불안", "상처", "슬픔", "중립"],
     "normalized": True  # L2 정규화 여부
 }
 ```
 
 ## 📊 데이터 설정
 
+- **클래스 수**: 7개 (기쁨, 당황, 분노, 불안, 상처, 슬픔, 중립)
 - **학습/검증 비율**: 90% / 10%
 - **이미지 크기**: 224 x 224 (CNN), 160 x 160 (FaceNet)
 - **정규화**: ImageNet mean/std (CNN), [-1, 1] (FaceNet)
@@ -338,18 +357,25 @@ uv run python src/pipeline.py --mode train
 
 # 또는 CNN만 사용 (FaceNet 추출 불필요)
 uv run python src/pipeline.py --mode train --no-facenet
+
+# 4. 실시간 플롯과 함께 학습
+uv run python src/pipeline.py --mode train --live-plot
 ```
 
 ## 📝 변경 이력
 
 - **v1.0**: 초기 버전
-- **v2.0**: YOLO 런타임 추출 → 사전 추출 방식으로 변경
+- **v2.0**: 런타임 추출 → 사전 추출 방식으로 변경
 - **v2.1**: CUDA 필수 체크 추가, 멀티스레딩 가속화
-- **v3.0**: **YOLO → FaceNet으로 전면 교체**
+- **v3.0**: **FaceNet 백본으로 전면 교체**
   - 얼굴 인식에 특화된 FaceNet 백본 사용
   - 512차원 L2 정규화 임베딩
   - VGGFace2 / CASIA-WebFace 사전학습 지원
   - 감정 인식 정확도 향상 기대 (65-72% → 75-82%)
+- **v3.1**: **기쁨(Joy) 클래스 추가**
+  - 7개 감정 클래스로 확장
+  - 실시간 학습 플로팅 기능 추가
+  - 학습 후 분석 리포트 기능 추가
 
 ## 📚 참고
 

@@ -21,14 +21,15 @@ class DataConfig:
     images_dir: Optional[Path] = field(default=None)
     labels_dir: Optional[Path] = field(default=None)
 
-    # 클래스 정의 (한국어 폴더명)
+    # 클래스 정의 (한국어 폴더명) - 기쁨 추가
     class_names_kr: List[str] = field(
-        default_factory=lambda: ["당황", "분노", "불안", "상처", "슬픔", "중립"]
+        default_factory=lambda: ["기쁨", "당황", "분노", "불안", "상처", "슬픔", "중립"]
     )
 
-    # 클래스 정의 (영어 표시명)
+    # 클래스 정의 (영어 표시명) - Joy 추가
     class_names_en: List[str] = field(
         default_factory=lambda: [
+            "Joy",
             "Embarrassed",
             "Angry",
             "Anxious",
@@ -38,7 +39,7 @@ class DataConfig:
         ]
     )
 
-    num_classes: int = 6
+    num_classes: int = 7  # 6 -> 7로 변경
 
     # 데이터 분할 비율
     train_ratio: float = 0.9  # 90% 학습, 10% 검증
@@ -118,6 +119,29 @@ class FusionConfig:
 
 
 @dataclass
+class PlottingConfig:
+    """실시간 Plotting 설정"""
+
+    # 실시간 플롯 활성화
+    enabled: bool = False
+
+    # 플롯 업데이트 간격 (에폭 단위)
+    update_interval: int = 1
+
+    # 그래프 크기
+    figsize: Tuple[int, int] = (14, 10)
+
+    # 그래프 저장 디렉토리 (None이면 checkpoint_dir 사용)
+    save_dir: Optional[Path] = None
+
+    # 다크 모드
+    dark_mode: bool = False
+
+    # 그래프 표시 여부 (False면 저장만)
+    show_plot: bool = True
+
+
+@dataclass
 class TrainingConfig:
     """학습 관련 설정"""
 
@@ -163,6 +187,9 @@ class TrainingConfig:
     # 로깅
     log_interval: int = 10  # 배치 단위
     tensorboard_dir: Path = Path(__file__).parent.parent / "runs"
+
+    # Plotting 설정
+    plotting: PlottingConfig = field(default_factory=PlottingConfig)
 
 
 @dataclass
@@ -319,6 +346,15 @@ def get_asian_face_config() -> Config:
     return config
 
 
+def get_live_plot_config() -> Config:
+    """실시간 플롯 활성화 설정"""
+    config = Config()
+    config.training.plotting.enabled = True
+    config.training.plotting.update_interval = 1
+    config.training.plotting.show_plot = True
+    return config
+
+
 # ============================================================
 # 유틸리티 함수
 # ============================================================
@@ -380,5 +416,10 @@ if __name__ == "__main__":
     print("\n[아시아인 얼굴 설정]")
     asian_config = get_asian_face_config()
     print(f"  - 사전학습: {asian_config.model.facenet.pretrained}")
+
+    print("\n[실시간 플롯 설정]")
+    plot_config = get_live_plot_config()
+    print(f"  - 플롯 활성화: {plot_config.training.plotting.enabled}")
+    print(f"  - 업데이트 간격: {plot_config.training.plotting.update_interval}")
 
     print("\n테스트 완료!")

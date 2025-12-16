@@ -1,27 +1,61 @@
 """
+Utility module for Hybrid Emotion Classification
 유틸리티 모듈
 
-이미지 처리, YOLO 벡터 추출 등의 유틸리티 함수들을 제공합니다.
-
-Note: extract_yolo_vectors 모듈은 ultralytics 패키지가 필요합니다.
-      설치: pip install ultralytics
+- cuda.py: CUDA 관련 유틸리티 함수
+- plotting.py: 실시간 학습 시각화
+- analysis.py: 모델 분석 및 평가 도구
 """
 
-__all__ = [
-    "YOLOBackboneExtractor",
-    "extract_features",
-    "get_image_paths",
-]
+from .analysis import (
+    AnalysisReport,
+    analyze_misclassifications,
+    compute_metrics,
+    plot_class_distribution,
+    plot_confusion_matrix,
+    plot_precision_recall_curves,
+    plot_roc_curves,
+)
+from .cuda import (
+    check_cuda_available,
+    clear_cuda_cache,
+    get_device,
+    get_gpu_memory_info,
+    get_optimal_num_workers,
+    print_cuda_info,
+    print_device_info,
+    print_gpu_memory_info,
+    print_system_info,
+    require_cuda,
+    setup_cuda_optimization,
+    setup_multiprocessing,
+)
+from .plotting import LivePlotter, TrainingVisualizer, plot_training_history
 
-# ultralytics가 설치된 경우에만 import
-try:
-    from .extract_yolo_vectors import (
-        YOLOBackboneExtractor,
-        extract_features,
-        get_image_paths,
-    )
-except ImportError:
-    # ultralytics가 설치되지 않은 경우 placeholder
-    YOLOBackboneExtractor = None  # type: ignore
-    extract_features = None  # type: ignore
-    get_image_paths = None  # type: ignore
+__all__ = [
+    # CUDA utilities
+    "check_cuda_available",
+    "clear_cuda_cache",
+    "get_device",
+    "get_gpu_memory_info",
+    "get_optimal_num_workers",
+    "print_cuda_info",
+    "print_device_info",
+    "print_gpu_memory_info",
+    "print_system_info",
+    "require_cuda",
+    "setup_cuda_optimization",
+    "setup_multiprocessing",
+    # Plotting
+    "LivePlotter",
+    "TrainingVisualizer",
+    "plot_training_history",
+    # Analysis
+    "AnalysisReport",
+    "compute_metrics",
+    "plot_confusion_matrix",
+    "plot_roc_curves",
+    "plot_precision_recall_curves",
+    "plot_class_distribution",
+    "analyze_misclassifications",
+]

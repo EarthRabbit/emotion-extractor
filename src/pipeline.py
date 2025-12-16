@@ -10,6 +10,7 @@ CNN + 사전 추출된 FaceNet 특징을 결합하여 감정을 분류합니다.
     - Label Smoothing 지원
     - Warmup Scheduler 지원
     - 다양한 프리셋 설정 지원
+    - 예측 시 FaceNet 벡터 실시간 추출
 
 사용법:
     python pipeline.py --mode train
@@ -52,6 +53,16 @@ from util.cuda import (  # noqa: E402
     setup_cuda_optimization,
     setup_multiprocessing,
 )
+
+# FaceNet 실시간 추출용 (MTCNN 얼굴 감지 포함)
+try:
+    from facenet_pytorch import MTCNN, InceptionResnetV1
+
+    FACENET_AVAILABLE = True
+    MTCNN_AVAILABLE = True
+except ImportError:
+    FACENET_AVAILABLE = False
+    MTCNN_AVAILABLE = False
 
 # ============================================================
 # 배너 및 설정
@@ -179,10 +190,12 @@ def create_model(config: Config) -> torch.nn.Module:
     elif use_cnn:
         # CNN만 사용 (Lite 모델)
         model = HybridEmotionModelLite(
-            input_dim=config.model.cnn.feature_dim,
-            hidden_dims=config.model.classifier.hidden_dims,
+            backbone=config.model.cnn.backbone,
+            feature_dim=config.model.cnn.feature_dim,
             num_classes=config.data.num_classes,
+            pretrained=config.model.cnn.pretrained,
             dropout=config.model.classifier.dropout,
+            classifier_hidden_dims=config.model.classifier.hidden_dims,
         )
     else:
         raise ValueError("최소 하나의 브랜치 (FaceNet 또는 CNN)가 필요합니다.")
@@ -459,9 +472,159 @@ def run_evaluation_analysis(config: Config, metrics, checkpoint_path: Path):
         print(f"  - 분석 모듈 로드 실패: {e}")
 
 
+def extract_facenet_vector_realtime(
+    image: Image.Image,
+    device: torch.device,
+    pretrained: str = "vggface2",
+) -> torch.Tensor:
+    """
+    단일 이미지에서 FaceNet 벡터를 실시간으로 추출
+
+    Args:
+        image: PIL 이미지
+        device: 연산 디바이스
+        pretrained: 사전학습 가중치 ('vggface2' 또는 'casia-webface')
+
+    Returns:
+        FaceNet 임베딩 벡터 [1, 512]
+    """
+    if not FACENET_AVAILABLE:
+        raise ImportError(
+            "facenet-pytorch 패키지가 필요합니다. 설치: pip install facenet-pytorch"
+        )
+
+    # FaceNet 모델 로드 (싱글톤 패턴으로 캐싱 가능하지만, 간단히 구현)
+    facenet_model = InceptionResnetV1(pretrained=pretrained).eval().to(device)
+
+    # FaceNet 입력 전처리 (160x160, 정규화)
+    from torchvision import transforms as T
+
+    facenet_transform = T.Compose(
+        [
+            T.Resize((160, 160)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ]
+    )
+
+    # 이미지 전처리
+    img_tensor = facenet_transform(image).unsqueeze(0).to(device)
+
+    # FaceNet 임베딩 추출
+    with torch.no_grad():
+        embedding = facenet_model(img_tensor)
+
+    return embedding
+
+
+# FaceNet 모델 캐시 (전역 변수로 재사용)
+_facenet_model_cache = None
+_mtcnn_model_cache = None
+
+
+def get_facenet_model(device: torch.device, pretrained: str = "vggface2"):
+    """FaceNet 모델을 캐시하여 반환 (재사용)"""
+    global _facenet_model_cache
+
+    if _facenet_model_cache is None:
+        if not FACENET_AVAILABLE:
+            raise ImportError(
+                "facenet-pytorch 패키지가 필요합니다. 설치: pip install facenet-pytorch"
+            )
+        print("  - FaceNet 모델 로드 중...")
+        _facenet_model_cache = (
+            InceptionResnetV1(pretrained=pretrained).eval().to(device)
+        )
+        print(f"  - FaceNet 사전학습: {pretrained}")
+
+    return _facenet_model_cache
+
+
+def get_mtcnn_model(device: torch.device):
+    """MTCNN 얼굴 감지 모델을 캐시하여 반환 (재사용)"""
+    global _mtcnn_model_cache
+
+    if _mtcnn_model_cache is None:
+        if not MTCNN_AVAILABLE:
+            raise ImportError(
+                "facenet-pytorch 패키지가 필요합니다. 설치: pip install facenet-pytorch"
+            )
+        print("  - MTCNN 얼굴 감지 모델 로드 중...")
+        _mtcnn_model_cache = MTCNN(
+            image_size=160,
+            margin=20,
+            min_face_size=20,
+            thresholds=[0.6, 0.7, 0.7],
+            factor=0.709,
+            post_process=False,  # PIL 이미지 반환
+            device=device,
+            keep_all=True,  # 모든 얼굴 감지
+        )
+
+    return _mtcnn_model_cache
+
+
+def detect_and_crop_face(
+    image: Image.Image,
+    device: torch.device,
+    margin_ratio: float = 0.2,
+) -> tuple:
+    """
+    MTCNN을 사용하여 얼굴을 감지하고 크롭
+
+    Args:
+        image: PIL 이미지
+        device: 연산 디바이스
+        margin_ratio: 바운딩 박스 주변 마진 비율
+
+    Returns:
+        (cropped_image, bbox, confidence) 또는 얼굴이 없으면 (None, None, None)
+    """
+    mtcnn = get_mtcnn_model(device)
+
+    # 얼굴 감지 (bounding boxes, probabilities)
+    boxes, probs = mtcnn.detect(image)
+
+    if boxes is None or len(boxes) == 0:
+        return None, None, None
+
+    # 가장 큰 얼굴 또는 가장 신뢰도 높은 얼굴 선택
+    if len(boxes) > 1:
+        # 가장 큰 얼굴 선택 (면적 기준)
+        areas = [(box[2] - box[0]) * (box[3] - box[1]) for box in boxes]
+        best_idx = max(range(len(areas)), key=lambda i: areas[i])
+    else:
+        best_idx = 0
+
+    box = boxes[best_idx]
+    prob = probs[best_idx] if probs is not None else 0.0
+
+    # 바운딩 박스 좌표 추출
+    x1, y1, x2, y2 = box
+    width = x2 - x1
+    height = y2 - y1
+
+    # 마진 추가
+    margin_x = width * margin_ratio
+    margin_y = height * margin_ratio
+
+    # 이미지 경계 내로 제한
+    img_width, img_height = image.size
+    x1 = max(0, int(x1 - margin_x))
+    y1 = max(0, int(y1 - margin_y))
+    x2 = min(img_width, int(x2 + margin_x))
+    y2 = min(img_height, int(y2 + margin_y))
+
+    # 크롭
+    cropped = image.crop((x1, y1, x2, y2))
+    bbox = (x1, y1, x2, y2)
+
+    return cropped, bbox, float(prob)
+
+
 @require_cuda
 def predict_pipeline(config: Config, args):
-    """예측 파이프라인 (CUDA 필수)"""
+    """예측 파이프라인 (CUDA 필수) - 얼굴 감지 + FaceNet 실시간 추출 지원"""
     print("\n" + "=" * 60)
     print("예측 파이프라인 시작")
     print("=" * 60)
@@ -484,16 +647,29 @@ def predict_pipeline(config: Config, args):
         print(f"Error: 체크포인트 파일을 찾을 수 없습니다: {checkpoint_path}")
         sys.exit(1)
 
-    # FaceNet 설정 (단일 이미지 예측에서는 FaceNet 비활성화)
-    # 실제 사용 시에는 해당 이미지의 FaceNet 벡터를 별도로 추출해야 함
-    if config.model.use_facenet_branch:
-        print("\n[주의] 단일 이미지 예측에서는 FaceNet 브랜치가 비활성화됩니다.")
-        print("FaceNet 특징을 사용하려면 벡터를 사전 추출하세요.")
+    # FaceNet/MTCNN 사용 여부 결정
+    use_facenet = config.model.use_facenet_branch and config.model.facenet.enabled
+    use_face_detection = MTCNN_AVAILABLE and not getattr(
+        args, "no_face_detection", False
+    )
+
+    if use_facenet and not FACENET_AVAILABLE:
+        print(
+            "\n[주의] facenet-pytorch가 설치되지 않아 FaceNet 브랜치를 비활성화합니다."
+        )
+        print("설치: pip install facenet-pytorch")
+        use_facenet = False
         config.model.use_facenet_branch = False
         config.model.facenet.enabled = False
 
+    if use_facenet:
+        print("\n[FaceNet] 실시간 벡터 추출 모드 활성화")
+
+    if use_face_detection:
+        print("[MTCNN] 얼굴 감지 및 크롭 모드 활성화")
+
     # 모델 로드
-    print("\n[1/3] 모델 로드 중...")
+    print("\n[1/5] 모델 로드 중...")
     model = create_model(config)
 
     if checkpoint_path:
@@ -508,17 +684,73 @@ def predict_pipeline(config: Config, args):
 
     model.eval()
 
-    # 이미지 로드 및 전처리
-    print("\n[2/3] 이미지 전처리 중...")
+    # 이미지 로드
+    print("\n[2/5] 이미지 로드 중...")
+    original_image = Image.open(image_path).convert("RGB")
+    print(f"  - 원본 이미지 크기: {original_image.size}")
+
+    # 얼굴 감지 및 크롭
+    face_bbox = None
+    face_confidence = None
+    if use_face_detection:
+        print("\n[3/5] 얼굴 감지 중...")
+        cropped_face, face_bbox, face_confidence = detect_and_crop_face(
+            original_image, config.device, margin_ratio=0.2
+        )
+
+        if cropped_face is not None:
+            print("  - 얼굴 감지 성공!")
+            print(f"  - 바운딩 박스: {face_bbox}")
+            print(f"  - 감지 신뢰도: {face_confidence:.4f}")
+            print(f"  - 크롭된 크기: {cropped_face.size}")
+            image_for_prediction = cropped_face
+        else:
+            print("  - [경고] 얼굴을 감지하지 못했습니다. 원본 이미지를 사용합니다.")
+            image_for_prediction = original_image
+    else:
+        print("\n[3/5] 얼굴 감지 건너뜀 (--no-face-detection 옵션)")
+        image_for_prediction = original_image
+
+    # CNN용 이미지 전처리
+    print("\n[4/5] 이미지 전처리 중...")
     transform = get_transforms(config.data.image_size, is_training=False)
-    image = Image.open(image_path).convert("RGB")
-    image_tensor: torch.Tensor = transform(image)  # type: ignore[assignment]
+    image_tensor: torch.Tensor = transform(image_for_prediction)  # type: ignore[assignment]
     image_tensor = image_tensor.unsqueeze(0).to(config.device)
 
+    # FaceNet 벡터 추출 (실시간) - 크롭된 얼굴 이미지 사용
+    facenet_vector = None
+    if use_facenet:
+        print("  - FaceNet 벡터 추출 중...")
+        from torchvision import transforms as T
+
+        facenet_transform = T.Compose(
+            [
+                T.Resize((160, 160)),
+                T.ToTensor(),
+                T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ]
+        )
+
+        facenet_model = get_facenet_model(
+            config.device, config.model.facenet.pretrained
+        )
+        # 크롭된 얼굴 이미지로 FaceNet 벡터 추출
+        facenet_input = (
+            facenet_transform(image_for_prediction).unsqueeze(0).to(config.device)
+        )
+
+        with torch.no_grad():
+            facenet_vector = facenet_model(facenet_input)
+        print(f"  - FaceNet 벡터 shape: {facenet_vector.shape}")
+
     # 예측
-    print("\n[3/3] 예측 중...")
+    print("\n[5/5] 예측 중...")
     with torch.no_grad():
-        outputs = model(image_tensor)
+        if use_facenet and facenet_vector is not None:
+            outputs = model(image_tensor, facenet_vector=facenet_vector)
+        else:
+            outputs = model(image_tensor)
+
         logits = outputs["logits"]
         probs = torch.softmax(logits, dim=1)
         pred_class = int(torch.argmax(probs, dim=1).item())
@@ -532,8 +764,13 @@ def predict_pipeline(config: Config, args):
     print("예측 결과")
     print("=" * 60)
     print(f"  - 이미지: {image_path}")
+    if face_bbox:
+        print(f"  - 얼굴 위치: {face_bbox}")
+        print(f"  - 얼굴 감지 신뢰도: {face_confidence:.4f}")
     print(f"  - 예측 클래스: {pred_name_kr} ({pred_name_en})")
-    print(f"  - 신뢰도: {confidence:.4f}")
+    print(f"  - 예측 신뢰도: {confidence:.4f}")
+    print(f"  - 얼굴 감지 사용: {'✓' if use_face_detection and face_bbox else '✗'}")
+    print(f"  - FaceNet 사용: {'✓' if use_facenet else '✗'}")
 
     print("\n[전체 확률]")
     for i, prob in enumerate(probs[0].tolist()):
@@ -548,6 +785,10 @@ def predict_pipeline(config: Config, args):
         "class_name_en": pred_name_en,
         "confidence": confidence,
         "probabilities": probs[0].tolist(),
+        "facenet_used": use_facenet,
+        "face_detected": face_bbox is not None,
+        "face_bbox": face_bbox,
+        "face_detection_confidence": face_confidence,
     }
 
 
@@ -750,6 +991,11 @@ def main():
         "--facenet-blocks",
         type=int,
         help="FaceNet Projector 블록 수 (기본값: 4)",
+    )
+    parser.add_argument(
+        "--no-face-detection",
+        action="store_true",
+        help="얼굴 감지 비활성화 (원본 이미지 그대로 사용)",
     )
     parser.add_argument("--checkpoint", type=str, help="체크포인트 파일 경로")
     parser.add_argument("--image", type=str, help="예측할 이미지 경로")

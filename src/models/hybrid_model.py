@@ -721,58 +721,81 @@ class HybridEmotionModel(nn.Module):
 
 class HybridEmotionModelLite(nn.Module):
     """
-    경량 하이브리드 감정 분류 모델
+    경량 하이브리드 감정 분류 모델 (CNN 전용)
 
-    추론 속도가 중요한 경우 사용합니다.
-    FaceNet 벡터만 사용하여 빠른 예측을 수행합니다.
+    FaceNet 벡터 없이 CNN만으로 감정을 분류합니다.
+    단일 이미지 예측이나 빠른 테스트에 적합합니다.
     """
 
     def __init__(
         self,
-        input_dim: int = 512,
-        hidden_dims: Optional[List[int]] = None,
+        backbone: str = "resnet18",
+        feature_dim: int = 512,
         num_classes: int = 7,
+        pretrained: bool = True,
         dropout: float = 0.3,
+        classifier_hidden_dims: Optional[List[int]] = None,
     ):
         super().__init__()
 
-        if hidden_dims is None:
-            hidden_dims = [256, 128]
+        if classifier_hidden_dims is None:
+            classifier_hidden_dims = [256, 128]
 
-        layers = []
-        prev_dim = input_dim
+        # CNN Feature Extractor
+        self.cnn = CNNFeatureExtractor(
+            backbone=backbone,
+            feature_dim=feature_dim,
+            pretrained=pretrained,
+            dropout=dropout,
+        )
 
-        for hidden_dim in hidden_dims:
-            layers.extend(
-                [
-                    nn.Linear(prev_dim, hidden_dim),
-                    nn.LayerNorm(hidden_dim),
-                    nn.GELU(),
-                    nn.Dropout(dropout),
-                ]
-            )
-            prev_dim = hidden_dim
+        # Classification Head
+        self.classifier = ClassificationHead(
+            input_dim=feature_dim,
+            hidden_dims=classifier_hidden_dims,
+            num_classes=num_classes,
+            dropout=dropout,
+            use_residual=True,
+        )
 
-        layers.append(nn.Linear(prev_dim, num_classes))
-        self.classifier = nn.Sequential(*layers)
+        # 호환성을 위한 플래그
+        self.use_facenet_branch = False
+        self.use_cnn_branch = True
 
-    def forward(self, facenet_vector: torch.Tensor) -> torch.Tensor:
+        print("HybridEmotionModelLite 초기화 (CNN 전용):")
+        print(f"  - 백본: {backbone}")
+        print(f"  - 특징 차원: {feature_dim}")
+        print(f"  - 클래스 수: {num_classes}")
+
+    def forward(
+        self,
+        image: torch.Tensor,
+        facenet_vector: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
         """
+        순전파 (facenet_vector는 무시됨)
+
         Args:
-            facenet_vector: FaceNet 벡터 [B, input_dim]
+            image: 입력 이미지 [B, C, H, W]
+            facenet_vector: 무시됨 (호환성용)
 
         Returns:
-            로짓 [B, num_classes]
+            dict with 'logits' and 'cnn_features'
         """
-        return self.classifier(facenet_vector)
+        features = self.cnn(image)
+        logits = self.classifier(features)
+        return {"logits": logits, "cnn_features": features}
 
     def predict(
-        self, facenet_vector: torch.Tensor
+        self,
+        image: torch.Tensor,
+        facenet_vector: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """예측 수행"""
         self.eval()
         with torch.no_grad():
-            logits = self.forward(facenet_vector)
+            outputs = self.forward(image)
+            logits = outputs["logits"]
             probs = F.softmax(logits, dim=1)
             preds = torch.argmax(probs, dim=1)
         return preds, probs
